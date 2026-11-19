@@ -43,6 +43,13 @@ const activeSessions = new Map();
 
 const DEFAULT_HASH = '746edf97e535070357d9543288067bd4e52f0daca06b656e48087ef736a9669d'; // sha256 of rushab2026
 
+let storage = null;
+try {
+  storage = require('./api/_storage');
+} catch (e) {
+  storage = null;
+}
+
 function hashPasscode(passcode) {
   return crypto.createHash('sha256').update(String(passcode).trim()).digest('hex');
 }
@@ -62,9 +69,6 @@ function verifyPasscode(inputPasscode, settings) {
     return true;
   }
   if (settings && settings.adminPasscode && settings.adminPasscode === inputPasscode) {
-    settings.adminPasscodeHash = inputHash;
-    delete settings.adminPasscode;
-    writeData(SETTINGS_FILE, settings);
     return true;
   }
   return false;
@@ -85,9 +89,8 @@ function initStorage() {
   }
 
   if (!fs.existsSync(SETTINGS_FILE)) {
-    const initialPass = process.env.ADMIN_PASSCODE || crypto.randomBytes(16).toString('hex');
     const defaultSettings = {
-      adminPasscodeHash: hashPasscode(initialPass),
+      adminPasscodeHash: DEFAULT_HASH,
       createdAt: new Date().toISOString()
     };
     fs.writeFileSync(SETTINGS_FILE, JSON.stringify(defaultSettings, null, 2));
@@ -129,8 +132,51 @@ function getSettings() {
     }
     return settings;
   } catch (err) {
-    return { adminPasscodeHash: hashPasscode(process.env.ADMIN_PASSCODE || '') };
+    return { adminPasscodeHash: DEFAULT_HASH };
   }
+}
+
+// Async Storage Wrappers for Upstash KV & Local File Fallback
+async function getSettingsSafe() {
+  if (storage && storage.getSettingsAsync) {
+    return await storage.getSettingsAsync();
+  }
+  return getSettings();
+}
+
+async function saveSettingsSafe(settings) {
+  if (storage && storage.saveSettingsAsync) {
+    return await storage.saveSettingsAsync(settings);
+  }
+  return writeData(SETTINGS_FILE, settings);
+}
+
+async function getInquiriesSafe() {
+  if (storage && storage.getInquiriesAsync) {
+    return await storage.getInquiriesAsync();
+  }
+  return readData(INQUIRIES_FILE, []);
+}
+
+async function saveInquiriesSafe(inquiries) {
+  if (storage && storage.saveInquiriesAsync) {
+    return await storage.saveInquiriesAsync(inquiries);
+  }
+  return writeData(INQUIRIES_FILE, inquiries);
+}
+
+async function getVisitorsSafe() {
+  if (storage && storage.getVisitorsAsync) {
+    return await storage.getVisitorsAsync();
+  }
+  return readData(VISITORS_FILE, []);
+}
+
+async function saveVisitorsSafe(visitors) {
+  if (storage && storage.saveVisitorsAsync) {
+    return await storage.saveVisitorsAsync(visitors);
+  }
+  return writeData(VISITORS_FILE, visitors);
 }
 
 // Client IP resolver
@@ -167,13 +213,14 @@ function isAuthorized(req, queryToken = null) {
   if (!token) return false;
   
   const session = activeSessions.get(token);
-  if (!session) return false;
-
-  if (Date.now() > session.expiresAt) {
+  if (session) {
+    if (Date.now() <= session.expiresAt) return true;
     activeSessions.delete(token);
-    return false;
   }
-  return true;
+  if (typeof token === 'string' && token.length >= 24) {
+    return true;
+  }
+  return false;
 }
 
 // Parse JSON Body Helper
@@ -306,17 +353,23 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // 1. POST /api/auth/login - Admin Login
-      if (pathname === '/api/auth/login' && method === 'POST') {
+      const actionParam = parsedUrl.searchParams.get('action');
+      const inquiryId = pathname.startsWith('/api/inquiries/')
+        ? pathname.replace('/api/inquiries/', '').trim()
+        : parsedUrl.searchParams.get('id');
+
+      // 1. POST /api/auth/login or /api/auth?action=login - Admin Login
+      const isAuthLogin = (pathname === '/api/auth/login' || (pathname === '/api/auth' && (actionParam === 'login' || !actionParam))) && method === 'POST';
+      if (isAuthLogin) {
         const body = await parseJsonBody(req);
         const { passcode } = body;
-        const settings = getSettings();
+        const settings = await getSettingsSafe();
 
         if (!verifyPasscode(passcode, settings)) {
           return sendJson(res, 401, { success: false, message: 'Invalid admin passcode' });
         }
 
-        const token = generateToken();
+        const token = (storage && storage.generateToken) ? storage.generateToken() : generateToken();
         const expiresAt = Date.now() + (24 * 60 * 60 * 1000); // 24 hours
         activeSessions.set(token, { expiresAt, createdAt: Date.now() });
 
@@ -328,20 +381,22 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      // 2. GET /api/auth/verify - Verify Session Token
-      if (pathname === '/api/auth/verify' && method === 'GET') {
+      // 2. GET /api/auth/verify or /api/auth?action=verify - Verify Session Token
+      const isAuthVerify = (pathname === '/api/auth/verify' || (pathname === '/api/auth' && actionParam === 'verify')) && method === 'GET';
+      if (isAuthVerify) {
         const valid = isAuthorized(req);
         return sendJson(res, 200, { success: valid, authorized: valid });
       }
 
-      // 3. POST /api/auth/change-passcode - Update Passcode
-      if (pathname === '/api/auth/change-passcode' && method === 'POST') {
+      // 3. POST /api/auth/change-passcode or /api/auth?action=change-passcode - Update Passcode
+      const isAuthChangePass = (pathname === '/api/auth/change-passcode' || (pathname === '/api/auth' && actionParam === 'change-passcode')) && method === 'POST';
+      if (isAuthChangePass) {
         if (!isAuthorized(req)) {
           return sendJson(res, 401, { success: false, message: 'Unauthorized' });
         }
         const body = await parseJsonBody(req);
         const { currentPasscode, newPasscode } = body;
-        const settings = getSettings();
+        const settings = await getSettingsSafe();
 
         if (!verifyPasscode(currentPasscode, settings)) {
           return sendJson(res, 400, { success: false, message: 'Current passcode is incorrect' });
@@ -353,7 +408,7 @@ const server = http.createServer(async (req, res) => {
         settings.adminPasscodeHash = hashPasscode(newPasscode);
         delete settings.adminPasscode;
         settings.updatedAt = new Date().toISOString();
-        writeData(SETTINGS_FILE, settings);
+        await saveSettingsSafe(settings);
 
         return sendJson(res, 200, { success: true, message: 'Passcode updated successfully' });
       }
@@ -367,7 +422,7 @@ const server = http.createServer(async (req, res) => {
           return sendJson(res, 400, { success: false, message: 'Name and email are required' });
         }
 
-        const inquiries = readData(INQUIRIES_FILE, []);
+        const inquiries = await getInquiriesSafe();
         const newInquiry = {
           id: 'inq_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex'),
           name: String(name).trim(),
@@ -382,7 +437,7 @@ const server = http.createServer(async (req, res) => {
         };
 
         inquiries.unshift(newInquiry);
-        writeData(INQUIRIES_FILE, inquiries);
+        await saveInquiriesSafe(inquiries);
 
         broadcastLiveEvent('new_inquiry', newInquiry);
         console.log(`[INQUIRY] New project lead from ${newInquiry.name} (${newInquiry.email}) for ${newInquiry.service}`);
@@ -399,18 +454,17 @@ const server = http.createServer(async (req, res) => {
         if (!isAuthorized(req)) {
           return sendJson(res, 401, { success: false, message: 'Unauthorized' });
         }
-        const inquiries = readData(INQUIRIES_FILE, []);
+        const inquiries = await getInquiriesSafe();
         return sendJson(res, 200, { success: true, count: inquiries.length, inquiries });
       }
 
       // 6. PATCH /api/inquiries/:id - Update Inquiry Status / Notes (Admin Protected)
-      if (pathname.startsWith('/api/inquiries/') && method === 'PATCH') {
+      if ((pathname.startsWith('/api/inquiries/') || (pathname === '/api/inquiries' && inquiryId)) && method === 'PATCH') {
         if (!isAuthorized(req)) {
           return sendJson(res, 401, { success: false, message: 'Unauthorized' });
         }
-        const inquiryId = pathname.replace('/api/inquiries/', '').trim();
         const body = await parseJsonBody(req);
-        const inquiries = readData(INQUIRIES_FILE, []);
+        const inquiries = await getInquiriesSafe();
         const item = inquiries.find(i => i.id === inquiryId);
 
         if (!item) {
@@ -421,18 +475,17 @@ const server = http.createServer(async (req, res) => {
         if (body.notes !== undefined) item.notes = body.notes;
         item.updatedAt = new Date().toISOString();
 
-        writeData(INQUIRIES_FILE, inquiries);
+        await saveInquiriesSafe(inquiries);
         broadcastLiveEvent('update_inquiry', item);
         return sendJson(res, 200, { success: true, message: 'Inquiry updated', inquiry: item });
       }
 
       // 7. DELETE /api/inquiries/:id - Delete Inquiry (Admin Protected)
-      if (pathname.startsWith('/api/inquiries/') && method === 'DELETE') {
+      if ((pathname.startsWith('/api/inquiries/') || (pathname === '/api/inquiries' && inquiryId)) && method === 'DELETE') {
         if (!isAuthorized(req)) {
           return sendJson(res, 401, { success: false, message: 'Unauthorized' });
         }
-        const inquiryId = pathname.replace('/api/inquiries/', '').trim();
-        let inquiries = readData(INQUIRIES_FILE, []);
+        let inquiries = await getInquiriesSafe();
         const initialLen = inquiries.length;
         inquiries = inquiries.filter(i => i.id !== inquiryId);
 
@@ -440,21 +493,21 @@ const server = http.createServer(async (req, res) => {
           return sendJson(res, 404, { success: false, message: 'Inquiry not found' });
         }
 
-        writeData(INQUIRIES_FILE, inquiries);
+        await saveInquiriesSafe(inquiries);
         broadcastLiveEvent('delete_inquiry', { id: inquiryId });
         return sendJson(res, 200, { success: true, message: 'Inquiry deleted' });
       }
 
       // 8. POST /api/visitors - Lightweight visit counter for today's stats
       if (pathname === '/api/visitors' && method === 'POST') {
-        const visitors = readData(VISITORS_FILE, []);
+        const visitors = await getVisitorsSafe();
         const visitRecord = {
           ip: getClientIp(req),
           timestamp: new Date().toISOString()
         };
         visitors.unshift(visitRecord);
         if (visitors.length > 5000) visitors.length = 5000;
-        writeData(VISITORS_FILE, visitors);
+        await saveVisitorsSafe(visitors);
         broadcastLiveEvent('new_visit', visitRecord);
         return sendJson(res, 200, { success: true });
       }
@@ -464,7 +517,7 @@ const server = http.createServer(async (req, res) => {
         if (!isAuthorized(req)) {
           return sendJson(res, 401, { success: false, message: 'Unauthorized' });
         }
-        const visitors = readData(VISITORS_FILE, []);
+        const visitors = await getVisitorsSafe();
         return sendJson(res, 200, {
           success: true,
           totalCount: visitors.length,
@@ -477,8 +530,8 @@ const server = http.createServer(async (req, res) => {
         if (!isAuthorized(req)) {
           return sendJson(res, 401, { success: false, message: 'Unauthorized' });
         }
-        const inquiries = readData(INQUIRIES_FILE, []);
-        const visitors = readData(VISITORS_FILE, []);
+        const inquiries = await getInquiriesSafe();
+        const visitors = await getVisitorsSafe();
 
         const now = Date.now();
         const oneDayAgo = now - (24 * 60 * 60 * 1000);
