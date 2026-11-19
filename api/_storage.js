@@ -65,8 +65,8 @@ function getSettings() {
 }
 
 // Upstash / Vercel KV Client
-const KV_URL = process.env.KV_REST_API_URL;
-const KV_TOKEN = process.env.KV_REST_API_TOKEN;
+const KV_URL = process.env.KV_REST_API_URL || 'https://polished-mallard-157363.upstash.io';
+const KV_TOKEN = process.env.KV_REST_API_TOKEN || 'gQAAAAAAAmazAAIgcDEwZTY0ODE0ZjUyMzI0OTB1OTVlMTMyOWEwMDg2MWUyZg';
 
 async function kvCommand(command) {
   if (!KV_URL || !KV_TOKEN) return null;
