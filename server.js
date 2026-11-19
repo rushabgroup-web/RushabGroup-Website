@@ -544,10 +544,17 @@ const server = http.createServer(async (req, res) => {
   }
 
   const safePath = path.normalize(targetPath).replace(/^(\.\.[\/\\])+/, '');
-  let filePath = path.join(__dirname, safePath);
+  let filePath = path.join(__dirname, 'public', safePath);
   if (!fs.existsSync(filePath)) {
-    const cwdPath = path.join(process.cwd(), safePath);
+    filePath = path.join(__dirname, safePath);
+  }
+  if (!fs.existsSync(filePath)) {
+    const cwdPath = path.join(process.cwd(), 'public', safePath);
     if (fs.existsSync(cwdPath)) filePath = cwdPath;
+    else {
+      const directCwd = path.join(process.cwd(), safePath);
+      if (fs.existsSync(directCwd)) filePath = directCwd;
+    }
   }
 
   serveStaticFile(req, res, filePath);
