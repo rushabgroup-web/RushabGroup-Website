@@ -9,14 +9,6 @@
     {
       "source": "/terms",
       "destination": "/terms.html"
-    },
-    {
-      "source": "/api/auth/:action",
-      "destination": "/api/auth?action=:action"
-    },
-    {
-      "source": "/api/inquiries/:id",
-      "destination": "/api/inquiries?id=:id"
     }
   ],
   "headers": [
